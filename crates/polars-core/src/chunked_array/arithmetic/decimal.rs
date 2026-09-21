@@ -3,7 +3,7 @@ use polars_compute::decimal::{
 };
 
 use super::*;
-use crate::prelude::arity::broadcast_try_binary_elementwise;
+use crate::prelude::arity::{broadcast_binary_elementwise, broadcast_try_binary_elementwise};
 
 impl Add for &DecimalChunked {
     type Output = PolarsResult<DecimalChunked>;
@@ -75,26 +75,35 @@ impl Mul for &DecimalChunked {
         let right_s = rhs.scale();
         let scale = left_s.max(right_s);
         let prec = DEC128_MAX_PREC;
-        let phys = broadcast_try_binary_elementwise(
-            self.physical(),
-            rhs.physical(),
-            |opt_l, opt_r| {
-                let (Some(l), Some(r)) = (opt_l, opt_r) else {
-                    return PolarsResult::Ok(None);
-                };
-                let ls = dec128_rescale(l, left_s, prec, scale).ok_or_else(|| {
+        let mut err = None;
+        let phys = broadcast_binary_elementwise(self.physical(), rhs.physical(), |opt_l, opt_r| {
+            let (Some(l), Some(r)) = (opt_l, opt_r) else {
+                return None;
+            };
+            let Some(ls) = dec128_rescale(l, left_s, prec, scale) else {
+                err.get_or_insert_with(|| {
                     polars_err!(ComputeError: "overflow in Decimal cast for {l} from scale {left_s} to {scale}")
-                })?;
-                let rs = dec128_rescale(r, right_s, prec, scale).ok_or_else(|| {
+                });
+                return None;
+            };
+            let Some(rs) = dec128_rescale(r, right_s, prec, scale) else {
+                err.get_or_insert_with(|| {
                     polars_err!(ComputeError: "overflow in Decimal cast for {r} from scale {right_s} to {scale}")
-                })?;
-                let ret = dec128_mul(ls, rs, prec, scale).ok_or_else(|| {
+                });
+                return None;
+            };
+            let Some(ret) = dec128_mul(ls, rs, prec, scale) else {
+                err.get_or_insert_with(|| {
                     polars_err!(ComputeError: "overflow in decimal multiplication for {ls} * {rs}")
-                })?;
-                Ok(Some(ret))
-            },
-        );
-        Ok(phys?.into_decimal_unchecked(prec, scale))
+                });
+                return None;
+            };
+            Some(ret)
+        });
+        if let Some(err) = err {
+            return Err(err);
+        }
+        Ok(phys.into_decimal_unchecked(prec, scale))
     }
 }
 
